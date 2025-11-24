@@ -1,0 +1,247 @@
+import OpenAI from "openai";
+import { storage } from "./storage";
+import { generateImage } from "./imageGenerator";
+
+export async function generateReply(message: string): Promise<{ reply: string; imageUrl?: string }> {
+  const msg = message.toLowerCase();
+
+  // Check if user wants to generate an image
+  if (
+    msg.includes("create image") ||
+    msg.includes("generate image") ||
+    msg.includes("draw me") ||
+    msg.includes("make an image") ||
+    msg.includes("generate a picture") ||
+    msg.includes("create a picture")
+  ) {
+    try {
+      const imageUrl = await generateImage(message);
+      return { reply: "Here's the image I created for you! You can download it using the download button.", imageUrl };
+    } catch (error) {
+      return { reply: "I wasn't able to generate that image. Please try again with a different description." };
+    }
+  }
+
+  if (msg.includes("remind me") || msg.includes("reminder")) {
+    const timeMatch = message.match(/at\s+(\d{1,2}(?::\d{2})?\s*(?:am|pm)?)/i);
+    const time = timeMatch ? timeMatch[1] : "";
+    
+    await storage.createReminder({ text: message, time });
+    
+    if (time) {
+      return { reply: `Got it! I've set a reminder for ${time}. I'll help you remember that.` };
+    }
+    return { reply: "Okay, I've saved that as a reminder for you." };
+  }
+
+  if (msg.includes("note") || msg.includes("remember this") || msg.includes("write down")) {
+    await storage.createNote({ text: message });
+    return { reply: "Got it, I've saved that as a note for you." };
+  }
+
+  // Handle schedule creation requests
+  if (msg.includes("schedule") || msg.includes("create schedule") || msg.includes("plan schedule") || msg.includes("daily schedule")) {
+    try {
+      const scheduleReply = await generatePersonalizedSchedule(message);
+      return scheduleReply;
+    } catch (error) {
+      console.error("Schedule generation failed:", error);
+      return { reply: "I need the OPENAI_API_KEY to create personalized schedules. Please ensure it's configured. For now, tell me what you'd like in your schedule (activities, times, priorities) and I'll help you plan it." };
+    }
+  }
+
+  // Use OpenAI API for general conversational responses
+  try {
+    if (!process.env.OPENAI_API_KEY) {
+      return getFallbackReply(message);
+    }
+
+    const openai = new OpenAI({
+      apiKey: process.env.OPENAI_API_KEY,
+    });
+
+    const systemPrompt = `You are an expert personal AI assistant focused on helping users become more productive, organized, and successful.
+
+COMMUNICATION STYLE:
+- Be concise and actionable (2-3 sentences max, unless asked for details)
+- Provide specific, practical advice - not generic recommendations
+- Show you understand the user's context and needs
+- Be encouraging but realistic
+- Use clear language and examples when helpful
+
+EXPERTISE AREAS:
+- Time management and scheduling strategies
+- Productivity optimization and focus techniques
+- Task prioritization and goal-setting
+- Motivation and overcoming procrastination
+- Work-life balance and wellness
+- General advice and problem-solving
+
+IMPORTANT GUIDELINES:
+- If user asks for recommendations/suggestions, provide SPECIFIC strategies with examples
+- For productivity questions, suggest evidence-based techniques (Pomodoro, time-blocking, etc)
+- Always explain the WHY behind recommendations
+- Ask clarifying questions if you need more context
+- Personalize advice based on what they tell you
+- Never give generic or vague advice`;
+
+    const response = await openai.chat.completions.create({
+      model: "gpt-3.5-turbo",
+      messages: [
+        { role: "system", content: systemPrompt },
+        { role: "user", content: message },
+      ],
+      temperature: 0.8,
+      max_tokens: 200,
+    });
+
+    const reply = response.choices[0]?.message?.content || "I'm here to help! What would you like to know?";
+    return { reply };
+  } catch (error) {
+    console.error("OpenAI error, falling back to basic responses:", error);
+    return getFallbackReply(message);
+  }
+}
+
+async function generatePersonalizedSchedule(userRequest: string): Promise<{ reply: string; scheduleData?: string }> {
+  try {
+    if (!process.env.OPENAI_API_KEY) {
+      throw new Error("OPENAI_API_KEY not configured");
+    }
+
+    const openai = new OpenAI({
+      apiKey: process.env.OPENAI_API_KEY,
+    });
+
+    // STEP 1: Analyze user's requirements from their exact message
+    const analysisPrompt = `Analyze this schedule request and extract EXACT requirements:
+"${userRequest}"
+
+Identify:
+1. Specific activities mentioned (work, exercise, meetings, learning, etc.)
+2. Preferred times if mentioned
+3. Duration for activities if mentioned
+4. Focus priorities (what's most important to them)
+5. Any constraints (wake time, sleep time, breaks)
+
+Return ONLY JSON (no markdown):
+{
+  "mentionedActivities": ["activity1", "activity2"],
+  "mentionedTimes": {},
+  "focusPriorities": ["priority1"],
+  "dayStart": "6:00 AM",
+  "dayEnd": "11:00 PM",
+  "constraints": []
+}`;
+
+    const analysisResponse = await openai.chat.completions.create({
+      model: "gpt-3.5-turbo",
+      messages: [{ role: "user", content: analysisPrompt }],
+      temperature: 0.7,
+      max_tokens: 300,
+    });
+
+    const analysisText = analysisResponse.choices[0]?.message?.content || "{}";
+    const analysisJsonMatch = analysisText.match(/\{[\s\S]*\}/);
+    const analysis = analysisJsonMatch ? JSON.parse(analysisJsonMatch[0]) : {};
+
+    // STEP 2: Generate schedule with ONLY what user asked for
+    const generateSchedulePrompt = `You are a schedule expert. Create a detailed schedule based on EXACTLY what the user requested:
+
+User Request: "${userRequest}"
+Analysis: ${JSON.stringify(analysis)}
+
+IMPORTANT RULES:
+1. ONLY include activities the user mentioned or implied
+2. If user wants specific timing, respect it
+3. Add necessary breaks and meal times
+4. Make schedule realistic and achievable
+5. No generic/default activities unless user implied them
+
+Return ONLY valid JSON with schedule items that MATCH the user's exact requirements:
+{
+  "items": [
+    {"time": "HH:MM AM/PM", "activity": "Exact activity from user request", "duration": "X minutes"}
+  ],
+  "title": "Title reflecting user's request",
+  "description": "What we optimized based on their requirements"
+}`;
+
+    const scheduleResponse = await openai.chat.completions.create({
+      model: "gpt-3.5-turbo",
+      messages: [{ role: "user", content: generateSchedulePrompt }],
+      temperature: 0.9,
+      max_tokens: 600,
+    });
+
+    const scheduleText = scheduleResponse.choices[0]?.message?.content || "";
+    const scheduleJsonMatch = scheduleText.match(/\{[\s\S]*\}/);
+    
+    if (!scheduleJsonMatch) {
+      throw new Error("Failed to parse schedule JSON");
+    }
+
+    const scheduleData = JSON.parse(scheduleJsonMatch[0]);
+
+    // STEP 3: Generate explanation of how schedule matches their requirements
+    const explainPrompt = `Create a brief explanation (2-3 sentences) of:
+1. What requirements we found in their request: "${userRequest}"
+2. How the schedule specifically addresses THEIR needs
+3. Why this particular arrangement works for THEIR goals
+
+Be specific to their actual request, not generic.`;
+
+    const explainResponse = await openai.chat.completions.create({
+      model: "gpt-3.5-turbo",
+      messages: [{ role: "user", content: explainPrompt }],
+      temperature: 0.7,
+      max_tokens: 200,
+    });
+
+    const explanation = explainResponse.choices[0]?.message?.content || "";
+
+    const schedule = {
+      id: `schedule-${Date.now()}`,
+      title: scheduleData.title || "Your Custom Schedule",
+      description: scheduleData.description || "Based on your requirements",
+      items: scheduleData.items || [],
+      createdAt: Date.now(),
+    };
+
+    // Verify we have actual schedule items
+    if (!schedule.items || schedule.items.length === 0) {
+      throw new Error("No schedule items generated");
+    }
+
+    return {
+      reply: `✓ Custom Schedule Created!\n\n${explanation}\n\nI analyzed your request and created a schedule tailored to your needs. Check the Schedule tab to view all ${schedule.items.length} time blocks. You can adjust any times based on your preferences.`,
+      scheduleData: JSON.stringify(schedule),
+    };
+  } catch (error) {
+    console.error("Schedule generation error:", error);
+    throw error;
+  }
+}
+
+
+function getFallbackReply(message: string): { reply: string } {
+  const msg = message.toLowerCase();
+  
+  if (msg.includes("meeting") || msg.includes("calendar")) {
+    return { reply: "I can help you with meetings and calendar planning. What specific meeting or event would you like to schedule?" };
+  }
+
+  if (msg.includes("task") || msg.includes("help me") || msg.includes("to-do") || msg.includes("productive")) {
+    return { reply: "Try these task strategies: (1) Write your top 3 priorities, (2) Tackle the most important one first, (3) Use Pomodoro (25 min work, 5 min rest). What's your main task?" };
+  }
+
+  if (msg.includes("hello") || msg.includes("hi ") || msg.includes("hey") || msg === "hi" || msg === "hey") {
+    return { reply: "Hello! I'm your personal AI assistant. I can help with reminders, notes, productivity advice, scheduling, and image generation. What would you like help with?" };
+  }
+
+  if (msg.includes("thank") || msg.includes("thanks")) {
+    return { reply: "You're welcome! I'm always here to help." };
+  }
+
+  return { reply: "That's an interesting question! I'm here to help with productivity, scheduling, reminders, notes, and advice. What can I assist you with?" };
+}
